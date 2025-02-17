@@ -1,13 +1,21 @@
 #!/bin/bash
-
-inject_traffic()
+start_iperf_server()
 {
-   echo "Injecting Traffic"
-   ip="${1}"
-   sudo ip netns exec ns_0 timeout 25 iperf3 -s 1>&2 &
-   sleep 1
-   sudo ip netns exec ns_1 iperf3 -c "${ip}" -t 20 1>&2 
-   sleep 2
+   ns="${1}"
+   ip="${2}"
+   sudo ip netns exec "${ns}" iperf3 -s -B "${ip}" -p 7575 -D --logfile /tmp/iperf3.txt --forceflush
+   while ! grep listening /tmp/iperf3.txt >/dev/null;do
+      sleep 1
+   done
+   echo "iperf server is running"
+}
+
+start_iperf_client()
+{
+   ns="${1}"
+   ip="${2}"
+   sudo ip netns exec "${ns}" iperf3 -c "${ip}" -t 20 -p 7575 1>&2 
+   sleep 5
 }
 
 filter_file()
@@ -30,17 +38,21 @@ compare()
    file2=$2
    threshold=2
 
-   skipfile1="ovs_interface_tx_retries ovs_interface_rx_dropped"
-   skipfile2="ovs_interface_rx_dropped"
+   skipstats="ovn ovs_interface_tx_retries ovs_interface_tx_errors"
+   echo "Filter: $skipstats"
 
-   filter_file "${file1}" "${file1}".tmp1 "${skipfile1}"
-   filter_file "${file2}" "${file2}".tmp1 "${skipfile2}"
+   filter_file "${file1}" "${file1}".tmp1 "${skipstats}"
+   filter_file "${file2}" "${file2}".tmp1 "${skipstats}"
 
    len1=$(wc -l "${file1}".tmp1 | awk '{print $1}')
    len2=$(wc -l "${file2}".tmp1 | awk '{print $1}')
 
    if [[ "${len1}" != "${len2}" ]];then
       echo "ERROR: Wrong number of statistics, files have different length ${len1} ${len2}"
+      echo "****** ${file1}".tmp1
+      cat "${file1}".tmp1
+      echo "****** ${file2}".tmp1
+      cat "${file2}".tmp1
       return 1
    fi
 
@@ -49,6 +61,10 @@ compare()
 
    if ! diff "${file1}".tmp2 "${file2}".tmp2;then
      echo "ERROR: Statistics set is not completed, Files have different fields"
+      echo "****** ${file1}".tmp2
+      cat "${file1}".tmp2
+      echo "****** ${file2}".tmp2
+      cat "${file2}".tmp2
      return 1
    fi
 
@@ -82,7 +98,6 @@ compare()
 	 fi
       fi
    done 4<"${file1}".tmp1 5<"${file2}".tmp1
-   rm "${file1}" "${file2}" "${file1}".tmp1 "${file1}".tmp2 "${file2}".tmp1 "${file2}".tmp2
    return "${retvalue}"
 }
 
@@ -92,9 +107,8 @@ get_stats()
   file2="${2}"
   options="${3}"
   echo "Getting stats"
-  rm "${file1}" "${file2}" 2>/dev/null
-  curl -o "${file1}" "${vm_ip}":1981/metrics 
-  ssh cloud-user@"${vm_ip}" /home/cloud-user/test_vm/get_ovs_stats.sh "${options}" >"${file2}"
+  curl -o "${file1}" http://localhost:1981/metrics 
+  $(dirname "$0")/get_ovs_stats.sh "${options}" >"${file2}"
   if [[ ! -f "$file1" || ! -f "$file2" ]];then
      echo "Failed to get statistics"
      ls -ls "$file1" "$file2"
@@ -112,49 +126,50 @@ check_sudo()
    return 1
 }
 
+restart_dataplane_node_exporter()
+{
+  sudo killall -9 dataplane-node-exporter 2>/dev/null
+  sudo ./dataplane-node-exporter &
+  sleep 5
+}
+
+test()
+{
+  ns="${1}"
+  ip="${2}"
+  dir="${3}"
+  testname="${4}"
+
+  restart_dataplane_node_exporter
+  file="${dir}/${testname}"
+  start_iperf_client "${ns}" "${ip}"
+  get_stats "${file}_1" "${file}_2"
+  compare "${file}_1" "${file}_2"
+  return $?
+}
+
 test1()
 {
   echo "Test1: Get statistics with default configuration"
-  ssh cloud-user@"${vm_ip}"  <<EOF
   sudo rm /etc/dataplane-node-exporter.yaml 2>/dev/null
-  sudo systemctl restart dataplane-node-exporter
-EOF
-  sleep 1
-  file="test1"
-  inject_traffic "${ns_0_ip}"
-  get_stats "${file}_1" "${file}_2"
-  compare "${file}_1" "${file}_2"
+  test $* "test1"
   return $?
 }
 
 test2()
 {
   echo "Test2: Get statistics with only with some collectors"
-  ssh cloud-user@"${vm_ip}"  <<EOF
   echo "collectors: [interface, memory]" | sudo tee /etc/dataplane-node-exporter.yaml
-  sudo systemctl restart dataplane-node-exporter
-EOF
-  sleep 1
-  file="test2"
-  inject_traffic "${ns_0_ip}"
-  get_stats "${file}_1" "${file}_2" "-c interface:memory"
-  compare "${file}_1" "${file}_2"
+  test $* "test2"
   return $?
 }
 
 test3()
 {
   echo "Test3: Get statistics with only with some collectors and metricsets"
-  ssh cloud-user@"${vm_ip}"  <<EOF
   echo "collectors: [interface, memory]" | sudo tee /etc/dataplane-node-exporter.yaml
   echo "metric-sets: [errors, counters]" | sudo tee -a /etc/dataplane-node-exporter.yaml
-  sudo systemctl restart dataplane-node-exporter
-EOF
-  sleep 1
-  file="test3"
-  inject_traffic "${ns_0_ip}"
-  get_stats "${file}_1" "${file}_2" "-c interface:memory -m errors:counters"
-  compare "${file}_1" "${file}_2"
+  test $* "test3"
   return $?
 }
 
@@ -162,9 +177,13 @@ run_tests()
 {
    ret=0
    testcases=$(echo "${1}" | tr ':' ' ')
+   ns="${2}"
+   ip="${3}"
+   dir="logs"
+   mkdir "${dir}" 2>/dev/null
    for test in ${testcases};do
-      $test | awk -v t="${test}" '{print t": "$0}'
-      ret_test=${PIPESTATUS[0]}
+      $test "${ns}" "${ip}" "${dir}"
+      ret_test=$?
       if [[ "${ret_test}" != 0 ]];then
          echo "${test}: Testcase failed"
 	 ret="${ret_test}"
@@ -201,10 +220,18 @@ if ! check_sudo;then
    exit 1
 fi
 
-vm_ip=$(grep vm_ip test_env | awk -F ':' '{print $2}' | sed 's/ //g')
-ns_0_ip=$(grep ns_0_ip test_env | awk -F ':' '{print $2}' | sed 's/ //g')
+ips=$(for ns in $(sudo ip netns ls | awk '{print $1}');do echo ${ns}:$(sudo ip netns exec ${ns} ip a | grep "inet " | awk '{print $2}' | awk -F '/' '{print $1}');done | tr '\n' ' ')
+echo "testcases: ${testcases}"
+echo "ips      : ${ips}"
+ns0=$(echo ${ips} | awk '{print $1}' | awk -F ':' '{print $1}')
+ip0=$(echo ${ips} | awk '{print $1}' | awk -F ':' '{print $2}')
+ns1=$(echo ${ips} | awk '{print $2}' | awk -F ':' '{print $1}')
+ip1=$(echo ${ips} | awk '{print $2}' | awk -F ':' '{print $2}')
+start_iperf_server "${ns0}" "${ip0}"
+
 if [[ "${verbose}" == "true" ]];then
-   run_tests "${testcases}"
+   run_tests "${testcases}" "${ns1}" "${ip0}"
 else
-   run_tests "${testcases}" 2>/dev/null
+   run_tests "${testcases}" "${ns1}" "${ip0}" 2>/dev/null
 fi
+killall -9 iperf3 2>/dev/null
