@@ -1,9 +1,15 @@
 #!/bin/bash
 
-image_url="https://cloud.centos.org/centos/9-stream/x86_64/images/CentOS-Stream-GenericCloud-9-latest.x86_64.qcow2"
-image_dl="/var/lib/libvirt/images/base/CentOS-Stream-GenericCloud-9-latest.x86_64.qcow2"
-image_vm="/var/lib/libvirt/images/centos-obs3.qcow2"
-vm_name="centos_obs3"
+#image_url="https://cloud.centos.org/centos/9-stream/x86_64/images/CentOS-Stream-GenericCloud-9-latest.x86_64.qcow2"
+#image_url="https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img"
+image_url="http://cloud-images.ubuntu.com/releases/22.04/release/ubuntu-22.04-server-cloudimg-amd64-disk-kvm.img"
+#image_dl="/var/lib/libvirt/images/base/CentOS-Stream-GenericCloud-9-latest.x86_64.qcow2"
+#image_dl="/var/lib/libvirt/images/base/jammy-server-cloudimg-amd64.img"
+image_dl="/var/lib/libvirt/images/base/ubuntu-22.04-server-cloudimg-amd64-disk-kvm.img"
+#image_vm="/var/lib/libvirt/images/centos-obs3.qcow2"
+image_vm="/var/lib/libvirt/images/ubuntu-2204.img"
+#vm_name="centos_obs3"
+vm_name="ubuntu_2204"
 ssh_wait=120
 
 c() {
@@ -23,9 +29,9 @@ configure_vm_image()
 {
   c sudo yum install virt-install virt-viewer guest-fish
   c sudo qemu-img create -f qcow2 -b "${image_dl}" -F qcow2 "${image_vm}" 15G
-  c sudo virt-customize -a "${image_vm}" \
-    --root-password password:12345678 \
-    -run-command "find /boot/loader/entries -name "*.conf" -exec sudo sed -i '/^options/s/$/iommu=pt intel_iommu=on default_hugepagesz=1G hugepagesz=1G hugepages=4/' {} \;"
+  c sudo virt-customize -a "${image_vm}" --root-password password:12345678
+  c virt-customize -a "${image_vm}" --run-command 'sed -i s/^PasswordAuthentication.*/PasswordAuthentication\ yes/ /etc/ssh/sshd_config'
+  c virt-customize -a "${image_vm}" --run-command 'sed -i s/^#PermitRootLogin.*/PermitRootLogin\ prohibit-password/ /etc/ssh/sshd_config'
 }
 
 spawn_vm()
@@ -34,16 +40,17 @@ spawn_vm()
   #cloud-config
   users:
     - name: cloud-user
-      passwd: "12345678"
+      passwd: 12345678
       ssh_authorized_keys:
         - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIE7GkEmmWufMEriDMIBc2fIIUON227m/qJ6gJN2gR+pT mnietoji@mnietoji-thinkpadp1gen3.rmtes.csb
+    - name: root
+      passwd: 12345678
 EOF
 
-  c sudo virt-install --name "${vm_name}" --os-variant centos-stream9 --vcpus 6 --memory 8192 \
-     --graphics vnc --virt-type kvm --disk "${image_vm}" --import \
-     --network default --network bridge=br0,model=e1000e --network bridge=br1,model=e1000e \
+  c sudo virt-install --name "${vm_name}" --os-variant ubuntu22.04 --vcpus 6 --memory 8192 \
+     --graphics vnc --virt-type kvm --disk "${image_vm}" --import --network default \
      --qemu-commandline="-device intel-iommu,intremap=on" --qemu-commandline="-machine q35,kernel-irqchip=split" \
-     --cloud-init user-data=user-data  --noautoconsole  --wait 1
+     --cloud-init user-data=user-data  --noautoconsole  --wait 2
 }
 
 conf_host_network()
@@ -88,6 +95,7 @@ conf_vm()
     echo "Waiting vm $ip to be up"
     ((counter+=1))
   done
+  exit
 
   scp -rp test_vm cloud-user@"${ip}":/home/cloud-user
   ssh cloud-user@"${ip}"  <<EOFS
@@ -166,7 +174,7 @@ install()
   clean
   download_image
   configure_vm_image
-  conf_host_network
+#  conf_host_network
   spawn_vm
   conf_vm
 }
